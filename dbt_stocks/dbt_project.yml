@@ -1,0 +1,30 @@
+# Name of the project
+name: 'dbt_stocks'
+version: '1.0.0'
+config-version: 2
+
+# This points to the profile in profiles.yml
+profile: 'dbt_stocks'
+
+# Directories for project assets
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Configure materialization strategies
+models:
+  dbt_stocks:
+    bronze:
+      +materialized: view
+    silver:
+      +materialized: table
+    gold:
+      +materialized: table
