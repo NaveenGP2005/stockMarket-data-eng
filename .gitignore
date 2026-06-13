@@ -26,3 +26,6 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+
+# Vector database
+chroma_db/

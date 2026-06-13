@@ -1,0 +1,11 @@
+langgraph
+google-genai
+ollama
+chromadb
+snowflake-connector-python
+yfinance
+streamlit
+pydantic
+pandas
+pyspark
+cryptography
