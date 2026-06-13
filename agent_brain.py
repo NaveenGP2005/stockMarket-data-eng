@@ -6,27 +6,64 @@ import chromadb
 import ollama
 from typing import List, TypedDict, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
 # Load environment variables
 load_dotenv(dotenv_path=os.path.abspath(".env"))
 
-# Check for Gemini API key
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY is not set in the .env file. Please add it to run the LLM.")
-
-# Initialize Gemini Client
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+def generate_text(prompt: str, system_instruction: str = None, response_schema = None) -> str:
+    """Generate text using local Ollama model."""
+    local_model = os.getenv("LOCAL_LLM_MODEL", "gemma2:2b")
+    
+    # Construct dynamic prompt for JSON schema guidance if response_schema is provided
+    if response_schema:
+        schema_desc = response_schema.schema() if hasattr(response_schema, "schema") else str(response_schema)
+        full_prompt = f"{prompt}\n\nYou must respond ONLY with a raw JSON object conforming to this schema:\n{schema_desc}\nReturn raw JSON text and do not wrap it in markdown block quotes (do not use ```json)."
+    else:
+        full_prompt = prompt
+    
+    print(f"[Ollama LLM] Generating using model '{local_model}'...")
+    response = ollama.generate(
+        model=local_model,
+        prompt=full_prompt,
+        system=system_instruction or ""
+    )
+    return response["response"].strip()
 
 # Database & Vector configurations
 CHROMA_PATH = "./chroma_db"
 COLLECTION_NAME = "financial_news"
 SNOWFLAKE_DB = "STOCKS_MDS"
 SNOWFLAKE_SCHEMA = "COMMON"
+
+SCHEMA_DESC = """
+We have the following views/tables in database STOCKS_MDS, schema COMMON:
+
+1. GOLD_KPI:
+   - SYMBOL (VARCHAR)
+   - CURRENT_PRICE (DOUBLE)
+   - CHANGE_AMOUNT (DOUBLE)
+   - CHANGE_PERCENT (DOUBLE)
+   Note: Contains exactly one row per stock symbol representing its latest price and KPI metrics. Do NOT sort by date/time columns when querying this table.
+
+2. GOLD_CANDLESTICK:
+   - SYMBOL (VARCHAR)
+   - CANDLE_TIME (DATE)
+   - CANDLE_LOW (DOUBLE)
+   - CANDLE_HIGH (DOUBLE)
+   - CANDLE_OPEN (DOUBLE)
+   - CANDLE_CLOSE (DOUBLE)
+   - TREND_LINE (DOUBLE)
+   Note: Contains historical timeseries candlestick data. Use CANDLE_TIME to filter or sort by date/time.
+
+3. GOLD_TREECHART:
+   - SYMBOL (VARCHAR)
+   - AVG_PRICE (DOUBLE) (Average stock price for latest day)
+   - VOLATILITY (DOUBLE) (All-time standard deviation of the stock)
+   - RELATIVE_VOLATILITY (DOUBLE) (Relative volatility coefficient)
+   Note: Contains exactly one row per stock symbol representing volatility rankings. Do NOT sort by date/time columns when querying this table.
+"""
 
 # Define the State Schema for LangGraph
 class AgentState(TypedDict):
@@ -43,7 +80,7 @@ class AgentState(TypedDict):
 
 # Pydantic schemas for structured LLM outputs
 class IntentDetection(BaseModel):
-    symbol: Optional[str] = Field(description="The stock ticker symbol mentioned (AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA) or None if not applicable.")
+    symbol: Optional[str] = Field(description="The stock ticker symbol mentioned (AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA) or null if not applicable.")
     intent: str = Field(description="The query intent: 'structured' (for purely quantitative metrics/prices), 'unstructured' (for news/sentiment), or 'hybrid' (for questions requiring both news reasons and numbers/prices).")
 
 # Helper functions
@@ -64,6 +101,26 @@ def get_snowflake_connection():
         schema=SNOWFLAKE_SCHEMA
     )
 
+def extract_json(text: str) -> str:
+    """Extracts a JSON substring from a text that might contain conversational filler or markdown blocks."""
+    text = text.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+        
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_str = text[first_brace:last_brace+1]
+        # Normalize single quotes to double quotes for keys and values
+        import re
+        json_str = re.sub(r"\'(\w+)\'\s*:", r'"\1":', json_str)
+        json_str = re.sub(r":\s*\'([^']*)\'", r': "\1"', json_str)
+        json_str = re.sub(r"\'(\w+)\'", r'"\1"', json_str)
+        return json_str
+    return text
+
 # --- GRAPH NODES ---
 
 def detect_intent_node(state: AgentState) -> Dict[str, Any]:
@@ -71,29 +128,47 @@ def detect_intent_node(state: AgentState) -> Dict[str, Any]:
     print("\n--- [Node] Detect Intent ---")
     query = state["query"]
     
-    if not genai_client:
-        return {"intent": "unstructured", "symbol": None}  # Fallback
-        
-    prompt = f"Analyze the user query: '{query}'"
+    prompt = f"""Analyze the user query: '{query}'
+Identify:
+1. The stock symbol mentioned: Choose from ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA']. If none of these are mentioned or applicable, use null.
+2. The query intent: 
+   - 'structured': for purely quantitative numbers, stock prices, volumes, KPIs, average price, volatility.
+   - 'unstructured': for news, reasons behind events, general sentiment, qualitative queries.
+   - 'hybrid': for questions requiring both numerical data (price, change, etc.) AND news/reasons.
+
+You must respond ONLY with a raw JSON object matching this format:
+{{
+  "symbol": "TICKER_OR_NULL",
+  "intent": "structured_or_unstructured_or_hybrid"
+}}
+
+Respond with the raw JSON object only. Do not include any explanation or markdown formatting."""
+
     try:
-        response = genai_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=IntentDetection,
-                system_instruction="You are a financial analyst routing queries. Categorize the intent and extract stock symbols."
-            )
+        res_text = generate_text(
+            prompt=prompt,
+            system_instruction="You are a financial analyst routing queries. Categorize the intent and extract stock symbols."
         )
-        data = json.loads(response.text)
-        print(f"Detected Intent: {data['intent']}, Symbol: {data['symbol']}")
+        # Parse JSON
+        clean_text = extract_json(res_text)
+        data = json.loads(clean_text)
+        # Standardize symbol to uppercase if not None
+        sym = data.get("symbol")
+        if isinstance(sym, str):
+            sym = sym.strip().upper()
+            if sym not in ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA']:
+                sym = None
+        else:
+            sym = None
+            
+        print(f"Detected Intent: {data.get('intent')}, Symbol: {sym}")
         return {
-            "intent": data["intent"],
-            "symbol": data["symbol"],
+            "intent": data.get("intent", "unstructured"),
+            "symbol": sym,
             "sql_retry_count": 0
         }
     except Exception as e:
-        print(f"Error in intent detection: {e}")
+        print(f"Error in intent detection: {e}. Falling back to unstructured.")
         return {"intent": "unstructured", "symbol": None, "sql_retry_count": 0}
 
 def write_sql_node(state: AgentState) -> Dict[str, Any]:
@@ -101,51 +176,25 @@ def write_sql_node(state: AgentState) -> Dict[str, Any]:
     print("\n--- [Node] Write SQL ---")
     query = state["query"]
     
-    schema_desc = """
-    We have the following views/tables in database STOCKS_MDS, schema COMMON:
-    
-    1. GOLD_KPI:
-       - SYMBOL (VARCHAR)
-       - CURRENT_PRICE (DOUBLE)
-       - CHANGE_AMOUNT (DOUBLE)
-       - CHANGE_PERCENT (DOUBLE)
-       
-    2. GOLD_CANDLESTICK:
-       - SYMBOL (VARCHAR)
-       - CANDLE_TIME (DATE)
-       - CANDLE_LOW (DOUBLE)
-       - CANDLE_HIGH (DOUBLE)
-       - CANDLE_OPEN (DOUBLE)
-       - CANDLE_CLOSE (DOUBLE)
-       - TREND_LINE (DOUBLE)
-       
-    3. GOLD_TREECHART:
-       - SYMBOL (VARCHAR)
-       - AVG_PRICE (DOUBLE) (Average stock price for latest day)
-       - VOLATILITY (DOUBLE) (All-time standard deviation of the stock)
-       - RELATIVE_VOLATILITY (DOUBLE) (Relative volatility coefficient)
-    """
-    
     prompt = f"""
     User Query: {query}
     
-    {schema_desc}
+    {SCHEMA_DESC}
     
-    Write a single Snowflake SQL query to answer the user query.
+    Write a single Snowflake SQL query to retrieve the quantitative data requested in the user query.
     Rules:
+    - Only write SQL to retrieve numbers/prices/KPIs (e.g. CURRENT_PRICE, CHANGE_PERCENT, AVG_PRICE, VOLATILITY, CANDLE_CLOSE).
+    - Do NOT write SQL trying to answer qualitative questions like 'why it dropped' or 'reasons'. Those are handled by our news database.
+    - Write exactly ONE single SELECT statement. Do not output multiple queries separated by semicolons.
     - Use uppercase for all table names and column names.
     - Return ONLY the raw SQL query. Do not wrap it in markdown code blocks or add explanations.
     """
     
     try:
-        response = genai_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You are an expert SQL translator converting natural language to Snowflake SQL. Return ONLY raw SQL text."
-            )
+        sql_query = generate_text(
+            prompt=prompt,
+            system_instruction="You are an expert SQL translator converting natural language to Snowflake SQL. Return ONLY raw SQL text."
         )
-        sql_query = response.text.strip()
         # Clean markdown code block wraps if model hallucinated them
         if sql_query.startswith("```sql"):
             sql_query = sql_query.replace("```sql", "", 1)
@@ -194,25 +243,28 @@ def correct_sql_node(state: AgentState) -> Dict[str, Any]:
     prompt = f"""
     The original question was: {original_query}
     
+    The database schema is:
+    {SCHEMA_DESC}
+    
     The generated SQL query was:
     {failed_sql}
     
     This query failed with the following Snowflake error:
     {error_msg}
     
-    Please correct the SQL query to fix the error and satisfy the original query.
-    Return ONLY the corrected raw SQL query. Do not wrap it in markdown code blocks or add explanations.
+    Please correct the SQL query to fix the error.
+    Rules:
+    - Only write SQL to retrieve numbers/prices/KPIs (e.g. CURRENT_PRICE, CHANGE_PERCENT, AVG_PRICE, VOLATILITY, CANDLE_CLOSE).
+    - Do NOT write SQL trying to answer qualitative questions like 'why it dropped' or 'reasons'. Those are handled by our news database.
+    - Write exactly ONE single SELECT statement. Do not output multiple queries separated by semicolons.
+    - Return ONLY the corrected raw SQL query. Do not wrap it in markdown code blocks or add explanations.
     """
     
     try:
-        response = genai_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You are an expert SQL debugging assistant. Review the SQL query and the database error message, correct the SQL, and return ONLY the raw SQL code."
-            )
+        corrected_sql = generate_text(
+            prompt=prompt,
+            system_instruction="You are an expert SQL debugging assistant. Review the SQL query and the database error message, correct the SQL, and return ONLY the raw SQL code."
         )
-        corrected_sql = response.text.strip()
         if corrected_sql.startswith("```sql"):
             corrected_sql = corrected_sql.replace("```sql", "", 1)
         if corrected_sql.startswith("```"):
@@ -312,14 +364,11 @@ def synthesize_response_node(state: AgentState) -> Dict[str, Any]:
     """
     
     try:
-        response = genai_client.models.generate_content(
-            model='gemini-1.5-pro',  # Use Pro for better synthesis and reports
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You are an elite Autonomous Financial Analyst. You synthesize hard numbers from relational databases and context from vector news sources into insights."
-            )
+        response_text = generate_text(
+            prompt=prompt,
+            system_instruction="You are an elite Autonomous Financial Analyst. You synthesize hard numbers from relational databases and context from vector news sources into insights."
         )
-        return {"response": response.text}
+        return {"response": response_text}
     except Exception as e:
         print(f"Error synthesizing response: {e}")
         return {"response": f"Error generating final response: {e}"}

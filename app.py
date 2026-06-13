@@ -2,6 +2,9 @@ import streamlit as st
 import os
 import time
 from dotenv import load_dotenv
+import importlib
+import agent_brain
+importlib.reload(agent_brain)
 from agent_brain import build_agent_graph, AgentState
 
 # Page configurations
@@ -95,16 +98,13 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### 🛠️ System Control Panel")
     
-    # Check Gemini API Key
-    api_key = os.getenv("GEMINI_API_KEY")
-    if api_key:
-        st.success("Gemini API Status: Connected")
-    else:
-        st.error("Gemini API Status: Missing Key")
-        api_key_input = st.text_input("Enter Gemini API Key", type="password")
-        if api_key_input:
-            os.environ["GEMINI_API_KEY"] = api_key_input
-            st.rerun()
+    # Ollama LLM Config
+    st.markdown("<div class='sidebar-section'>", unsafe_allow_html=True)
+    st.markdown("**🤖 Language Model (Local)**")
+    local_model = st.text_input("Ollama Model", value=os.getenv("LOCAL_LLM_MODEL", "gemma2:2b"))
+    os.environ["LOCAL_LLM_MODEL"] = local_model
+    st.markdown("Status: **Ollama Active**")
+    st.markdown("</div>", unsafe_allow_html=True)
             
     # Check Snowflake Configuration
     st.markdown("<div class='sidebar-section'>", unsafe_allow_html=True)
@@ -152,98 +152,95 @@ if st.button("🚀 Analyze Market Data", type="primary") and user_query:
     # Clear query cache to prevent input field issues
     st.session_state.query = user_query
     
-    if not os.getenv("GEMINI_API_KEY"):
-        st.error("Please set your GEMINI_API_KEY in the sidebar or `.env` file first.")
-    else:
-        # Create execution spaces
-        status_header = st.empty()
-        status_box = st.container()
-        report_box = st.empty()
-        details_box = st.container()
+    # Create execution spaces
+    status_header = st.empty()
+    status_box = st.container()
+    report_box = st.empty()
+    details_box = st.container()
+    
+    status_header.markdown("### 🧠 Agent Execution Steps")
+    
+    # Initialize graph
+    app = build_agent_graph()
+    initial_state = {
+        "query": user_query,
+        "symbol": None,
+        "intent": None,
+        "sql_query": None,
+        "sql_error": None,
+        "sql_results": None,
+        "sql_columns": None,
+        "news_context": None,
+        "response": None,
+        "sql_retry_count": 0
+    }
+    
+    # Keep track of UI representations of steps
+    steps_history = []
+    
+    def render_steps():
+        with status_box:
+            for idx, (name, status) in enumerate(steps_history):
+                cls = "success" if status == "done" else "active"
+                st.markdown(f"<div class='step-card {cls}'><b>Step {idx+1}:</b> {name}</div>", unsafe_allow_html=True)
+    
+    # Stream the LangGraph execution
+    try:
+        current_state = initial_state
         
-        status_header.markdown("### 🧠 Agent Execution Steps")
-        
-        # Initialize graph
-        app = build_agent_graph()
-        initial_state = {
-            "query": user_query,
-            "symbol": None,
-            "intent": None,
-            "sql_query": None,
-            "sql_error": None,
-            "sql_results": None,
-            "sql_columns": None,
-            "news_context": None,
-            "response": None,
-            "sql_retry_count": 0
-        }
-        
-        # Keep track of UI representations of steps
-        steps_history = []
-        
-        def render_steps():
-            with status_box:
-                for idx, (name, status) in enumerate(steps_history):
-                    cls = "success" if status == "done" else "active"
-                    st.markdown(f"<div class='step-card {cls}'><b>Step {idx+1}:</b> {name}</div>", unsafe_allow_html=True)
-        
-        # Stream the LangGraph execution
-        try:
-            current_state = initial_state
-            
-            # Start streaming nodes
-            for event in app.stream(initial_state):
-                for node_name, node_output in event.items():
-                    current_state.update(node_output)
-                    
-                    if node_name == "detect_intent":
-                        steps_history.append((f"Intent Detected: <b>{current_state['intent'].upper()}</b> (Asset: <b>{current_state['symbol']}</b>)", "done"))
-                    elif node_name == "write_sql":
-                        steps_history.append(("Snowflake SQL generated", "done"))
-                    elif node_name == "execute_sql":
-                        if current_state.get("sql_error"):
-                            steps_history.append((f"SQL Execution failed: <span style='color:#f87171'>{current_state['sql_error'][:100]}...</span>", "active"))
-                        else:
-                            steps_history.append(f"SQL Executed successfully on Snowflake (Returned {len(current_state.get('sql_results', []))} rows)", "done")
-                    elif node_name == "correct_sql":
-                        steps_history.append((f"Auto-correcting SQL (Attempt {current_state.get('sql_retry_count', 0)})...", "done"))
-                    elif node_name == "retrieve_news":
-                        steps_history.append("Retrieved news matching queries from ChromaDB Vector Store", "done")
-                    elif node_name == "synthesize_response":
-                        steps_history.append("Synthesizing metrics and news headlines into markdown report", "done")
-                    
-                    render_steps()
-                    time.sleep(0.5)
-            
-            # Print Final Report
-            report_box.markdown("---")
-            report_box.markdown("## 📊 Autonomous Analyst Report")
-            report_box.markdown(current_state["response"])
-            
-            # Display raw query/results in tabs
-            with details_box:
-                st.markdown("### 🔍 Technical Details")
-                tab1, tab2, tab3 = st.tabs(["💻 Snowflake SQL Query", "🔢 Database Rows", "📰 Retrieved Vector News"])
+        # Start streaming nodes
+        for event in app.stream(initial_state):
+            for node_name, node_output in event.items():
+                current_state.update(node_output)
                 
-                with tab1:
-                    if current_state.get("sql_query"):
-                        st.code(current_state["sql_query"], language="sql")
+                if node_name == "detect_intent":
+                    steps_history.append((f"Intent Detected: <b>{current_state['intent'].upper()}</b> (Asset: <b>{current_state['symbol']}</b>)", "done"))
+                elif node_name == "write_sql":
+                    steps_history.append(("Snowflake SQL generated", "done"))
+                elif node_name == "execute_sql":
+                    if current_state.get("sql_error"):
+                        steps_history.append((f"SQL Execution failed: <span style='color:#f87171'>{current_state['sql_error'][:100]}...</span>", "active"))
                     else:
-                        st.write("No SQL query executed.")
-                        
-                with tab2:
-                    if current_state.get("sql_results") is not None:
-                        import pandas as pd
-                        df = pd.DataFrame(current_state["sql_results"], columns=current_state.get("sql_columns", []))
-                        st.dataframe(df, use_container_width=True)
-                    else:
-                        st.write("No SQL query results.")
-                        
-                with tab3:
-                    if current_state.get("news_context"):
-                        st.text_area("Vector Search Results", current_state["news_context"], height=300)
-                    else:
-                        st.write("No news articles retrieved.")
-                        
-        except Exception as ex:
-            st.error(f"An error occurred during workflow execution: {ex}")
+                        steps_history.append((f"SQL Executed successfully on Snowflake (Returned {len(current_state.get('sql_results', []))} rows)", "done"))
+                elif node_name == "correct_sql":
+                    steps_history.append((f"Auto-correcting SQL (Attempt {current_state.get('sql_retry_count', 0)})...", "done"))
+                elif node_name == "retrieve_news":
+                    steps_history.append(("Retrieved news matching queries from ChromaDB Vector Store", "done"))
+                elif node_name == "synthesize_response":
+                    steps_history.append(("Synthesizing metrics and news headlines into markdown report", "done"))
+                
+                render_steps()
+                time.sleep(0.5)
+        
+        # Print Final Report
+        report_box.markdown("---")
+        report_box.markdown("## 📊 Autonomous Analyst Report")
+        report_box.markdown(current_state["response"])
+        
+        # Display raw query/results in tabs
+        with details_box:
+            st.markdown("### 🔍 Technical Details")
+            tab1, tab2, tab3 = st.tabs(["💻 Snowflake SQL Query", "🔢 Database Rows", "📰 Retrieved Vector News"])
+            
+            with tab1:
+                if current_state.get("sql_query"):
+                    st.code(current_state["sql_query"], language="sql")
+                else:
+                    st.write("No SQL query executed.")
+                    
+            with tab2:
+                if current_state.get("sql_results") is not None:
+                    import pandas as pd
+                    df = pd.DataFrame(current_state["sql_results"], columns=current_state.get("sql_columns", []))
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.write("No SQL query results.")
+                    
+            with tab3:
+                if current_state.get("news_context"):
+                    st.text_area("Vector Search Results", current_state["news_context"], height=300)
+                else:
+                    st.write("No news articles retrieved.")
+                    
+    except Exception as ex:
+        st.error(f"An error occurred during workflow execution: {ex}")
