@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stocks-analyst-config
+  labels:
+    app: stocks-analyst
+data:
+  OLLAMA_HOST: "http://host.docker.internal:11434"
+  SNOWFLAKE_WAREHOUSE: "COMPUTE_WH"
+  SNOWFLAKE_ROLE: "ACCOUNTADMIN"

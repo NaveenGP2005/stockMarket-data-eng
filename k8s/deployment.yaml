@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stocks-analyst-deployment
+  labels:
+    app: stocks-analyst
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stocks-analyst
+  template:
+    metadata:
+      labels:
+        app: stocks-analyst
+    spec:
+      containers:
+      - name: analyst-app
+        image: stocks-analyst:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8501
+        env:
+        - name: OLLAMA_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: stocks-analyst-config
+              key: OLLAMA_HOST
+        - name: SNOWFLAKE_WAREHOUSE
+          valueFrom:
+            configMapKeyRef:
+              name: stocks-analyst-config
+              key: SNOWFLAKE_WAREHOUSE
+        - name: SNOWFLAKE_ROLE
+          valueFrom:
+            configMapKeyRef:
+              name: stocks-analyst-config
+              key: SNOWFLAKE_ROLE
+        - name: SNOWFLAKE_USER
+          valueFrom:
+            secretKeyRef:
+              name: stocks-analyst-secrets
+              key: SNOWFLAKE_USER
+        - name: SNOWFLAKE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: stocks-analyst-secrets
+              key: SNOWFLAKE_PASSWORD
+        - name: SNOWFLAKE_ACCOUNT
+          valueFrom:
+            secretKeyRef:
+              name: stocks-analyst-secrets
+              key: SNOWFLAKE_ACCOUNT
+        volumeMounts:
+        - name: chroma-data
+          mountPath: /app/chroma_db
+      volumes:
+      - name: chroma-data
+        hostPath:
+          path: "/run/desktop/mnt/host/d/Internship/Data Engineering toy project/real-time-stocks-mds-main/chroma_db"
+          type: DirectoryOrCreate

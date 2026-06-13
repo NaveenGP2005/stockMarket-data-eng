@@ -29,3 +29,6 @@ __pycache__/
 
 # Vector database
 chroma_db/
+
+# Generated Kubernetes secrets
+*secrets_generated.yaml
